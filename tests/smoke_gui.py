@@ -853,6 +853,11 @@ if screen is not None:
 print("10b 标题栏最大化按钮: 点得动、字形跟着状态换、还原后尺寸回原样")
 
 # 10c) 标题栏：状态胶囊六档、版本号那枚小字、窗口控制与功能按钮的层级分开
+# 整节先把 ffmpeg 钉成「找得到」：GitHub 的 Windows runner 上没装 ffmpeg，
+# FFMPEG_PATH 是 None，而「缺少 ffmpeg」这一档压在其它所有档前面，不钉住的话
+# 第一句「监控中」就红成「缺少 ffmpeg」。缺工具那一档下面自己 patch None 来验。
+_saved_ffmpeg = config.FFMPEG_PATH
+config.FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
 bar = window.title_bar
 bar.set_status(True, False, 0)
 assert bar.status_label.text() == "监控中", bar.status_label.text()
@@ -921,7 +926,8 @@ try:
     assert bar.status_label.text() == "未启动", "工具回来了胶囊却没跟着改口"
     assert bar.status_label.parentWidget().toolTip() == "", "缺工具的提示留在胶囊上了"
 finally:
-    config.FFMPEG_PATH = _real_ffmpeg
+    # 交回本机真实情况（runner 上就是 None），后面的节不活在这节的假象里
+    config.FFMPEG_PATH = _saved_ffmpeg
     bar.refresh_theme()
 assert f"v{config.APP_VERSION}" in [label.text() for label in bar.findChildren(QLabel)], \
     "标题栏那枚小字还是写死的「GUI」"
