@@ -1,0 +1,19 @@
+# 虚拟环境与IDE
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# 备份文件：旧版 .bak 里含真实 sid，绝不入库
+*.bak
+
+# 登录态与录制产物
+ui_settings.json
+xhs_live_recorder/
+
+# 打包产物：exe 和中间目录都是跑一次 recorder.spec 就有的东西，不进仓库
+# dist_nohidden 这类暂存目录是给「正在录的那份 exe」腾出来的，构建到新目录再换
+build/
+build_*/
+dist/
+dist_*/

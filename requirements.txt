@@ -1,0 +1,10 @@
+# 界面用的 GUI 框架；只用终端模式（python main.py --cli）的话可以不装
+PySide6>=6.5
+# 接口请求
+requests>=2.31
+
+# 打包才需要（python -m PyInstaller recorder.spec）；源码方式运行用不上
+pyinstaller>=6.22
+
+# 录制靠 ffmpeg，它不是 pip 包：装到系统 PATH 里，或者把 ffmpeg.exe 放在
+# 项目根目录（源码运行时）/ exe 同目录（打包后）。程序启动时在设置页能看到有没有找到。
