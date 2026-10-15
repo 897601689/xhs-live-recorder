@@ -1,0 +1,90 @@
+# 手动打一个 Windows 单文件 exe：Actions → 「打包 Windows 版」→ Run workflow。
+#
+# 为什么不挂在 push 上：PyInstaller 不能交叉编译，一台 runner 只能出它自己系统的包；
+# 一轮下载 Qt 轮子 + 跑三份冒烟 + 打包约十分钟，而仓库里多数提交是文档和界面微调，
+# 每次 push 都出一个没人测过的包反而更容易拿错版本。
+#
+# 产物挂在本次运行的 Artifacts 里（不是 Release），下载后和 dist\小红书直播录制器.exe 等价：
+# ffmpeg 不打包，靠系统 PATH 或放在 exe 同目录。未做代码签名，别人第一次运行可能被
+# SmartScreen 拦一次。
+name: 打包 Windows 版
+
+on:
+  workflow_dispatch:
+    inputs:
+      retention:
+        description: 产物保留天数
+        type: choice
+        default: "30"
+        options:
+          - "1"
+          - "7"
+          - "30"
+          - "90"
+
+permissions:
+  contents: read
+
+# 同一时间只让一条构建在跑；正在跑的不清掉，避免手滑把别人等的包取消
+concurrency:
+  group: build-windows
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与开发机对齐：本机是 Python 3.14.2 + PySide6 6.11.2。CI 换 Python 小版本
+      # 等于换一份 Qt，界面上的差异只能靠那三份冒烟兜，没必要主动冒险。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          architecture: x64
+          cache: pip
+
+      # requirements.txt 里已经带着 pyinstaller（它只在打包时才用得上），一步装完
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # 三份都得绿再打：测试挂了就没必要留一个明知有问题的产物
+      - name: 静态检查
+        run: python tests/static_check.py
+
+      - name: 核心层冒烟
+        run: python tests/smoke_core.py
+
+      # smoke_gui.py 自己会把 Qt 切成 offscreen，runner 上没有交互桌面也过得去
+      - name: 界面冒烟
+        run: python tests/smoke_gui.py
+
+      - name: 打包
+        run: python -m PyInstaller recorder.spec --noconfirm
+
+      # 用通配而不是写死中文名：runner 上的 PowerShell 读脚本走 UTF-8，能跑，
+      # 但把中文留在日志里、把 *.exe 留在路径里，少一处编码差异少一处坑
+      - name: 核对产物
+        run: |
+          $exe = Get-ChildItem dist -Filter *.exe | Select-Object -First 1
+          if ($null -eq $exe) {
+            Write-Host "::error::dist 里没有 exe，打包这一步没出东西"
+            exit 1
+          }
+          Write-Host "产物: $($exe.Name)  $($exe.Length) 字节  改动于 $($exe.LastWriteTime)"
+          Write-Host "md5: $((Get-FileHash $exe.FullName -Algorithm MD5).Hash.ToLower())"
+          if ($exe.Length -lt 20000000) {
+            Write-Host "::error::产物小于 20MB，多半是 PyInstaller 只写了引导壳就断了"
+            exit 1
+          }
+
+      # artifact 名必须是 ASCII：Actions 的产物名不接中文，但包里的 exe 保留中文名
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xhs-live-recorder-windows-x64-run${{ github.run_number }}
+          path: dist/*.exe
+          retention-days: ${{ inputs.retention }}
+          if-no-files-found: error
