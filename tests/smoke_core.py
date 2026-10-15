@@ -390,11 +390,17 @@ def _fake_popen(_cmd, **kwargs):
 
 real_subprocess = recorder.subprocess
 real_session = net._session
+saved_ffmpeg = config.FFMPEG_PATH
 recorder.subprocess = types.SimpleNamespace(PIPE=_sp.PIPE, DEVNULL=_sp.DEVNULL,
                                             TimeoutExpired=_sp.TimeoutExpired,
                                             Popen=_fake_popen)
 net._session = lambda: types.SimpleNamespace(get=lambda *a, **k: _FakeResp())
 try:
+    # 这条验的是「真去 Popen 时参数长什么样」，所以先把 ffmpeg 路径钉成有值：
+    # GitHub 的 Windows runner 上没装 ffmpeg，FFMPEG_PATH 是 None，recorder.py 里
+    # 那道「未找到 ffmpeg」守卫会在走到假 Popen 之前就返回 fatal —— 测试就变成
+    # 「这台机器恰好装了 ffmpeg」的隐性依赖（首跑在 CI 上红在这里）。
+    config.FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
     status, _size = _real_record_once(dict(USER, video_url="http://example/flv"),
                                       "k14", os.path.join(TMP_ROOT, "n14.mkv"), 0, 0)
     assert status == recorder.REC_RETRY, status
@@ -403,6 +409,7 @@ try:
 finally:
     recorder.subprocess = real_subprocess
     net._session = real_session
+    config.FFMPEG_PATH = saved_ffmpeg
 print("14 ffmpeg 子进程:", spawned["creationflags"], "= 不带控制台窗口")
 
 # 15) 实时预览：ffplay 也是控制台程序，同样会带出黑框；而且它比录制更容易被当成
