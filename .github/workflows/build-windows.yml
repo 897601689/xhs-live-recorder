@@ -4,10 +4,11 @@
 # 一轮下载 Qt 轮子 + 跑三份冒烟 + 打包约十分钟，而仓库里多数提交是文档和界面微调，
 # 每次 push 都出一个没人测过的包反而更容易拿错版本。
 #
-# 产物会以「草稿 Release」形式发布，你在 Releases 页面确认后点 Publish；
-# 同时保留一份 Artifacts 备份。exe 走英文名 xhs-live-recorder-<版本>.exe，
-# 附 zip 与 SHA256SUMS.txt。ffmpeg 不打包，靠系统 PATH 或放在 exe 同目录；
-# 未做代码签名，别人第一次运行可能被 SmartScreen 拦一次。
+# 产物以「草稿 Release」形式发布，你在 Releases 页面确认后点 Publish；
+# 同时保留一份 Artifacts 备份（带 run number，与线上资产一一对应）。
+# exe 走英文名 xhs-live-recorder-<版本>.exe，附同名 zip 与 SHA256SUMS.txt。
+# ffmpeg 不打包，靠系统 PATH 或放在 exe 同目录；未做代码签名，别人第一次
+# 运行可能被 SmartScreen 拦一次。
 name: 打包 Windows 版
 
 on:
@@ -18,7 +19,7 @@ on:
         required: true
         type: string
       retention:
-        description: "产物 Artifacts 备份保留天数（Release 本身无过期）"
+        description: "Artifacts 备份保留天数（Release 本身无过期）"
         type: choice
         default: "30"
         options:
@@ -27,6 +28,7 @@ on:
           - "30"
           - "90"
 
+# 建 Release / 删旧草稿 / 推删 tag 都需要写权限，默认的只读 token 会被 403
 permissions:
   contents: write
 
@@ -40,17 +42,62 @@ jobs:
     runs-on: windows-latest
 
     # runner 是英文区域，Python 的 stdout 默认 cp1252，三份冒烟一印中文就
-    # UnicodeEncodeError。只压 stdout/stderr，不开 PYTHONUTF8=1：那会连
-    # open() 的默认编码一起改掉，与本机环境差得比需要的更远。
+    # UnicodeEncodeError（第一次跑就死在「静态检查」）。只压 stdout/stderr，
+    # 不开 PYTHONUTF8=1：那会连 open() 的默认编码一起改掉，与本机环境差得更远。
     env:
       PYTHONIOENCODING: utf-8
 
     steps:
-      - uses: actions/checkout@v4
+      # 放在最前面做快速失败：版本号格式不对或已经正式发布过，就没必要白跑十分钟打包。
+      # 只查远端、不依赖代码，所以不需要先 checkout（GH_REPO 已给出仓库身份）。
+      - name: 校验版本号并查旧 Release
+        shell: pwsh
+        run: |
+          $ver = $env:VERSION
+
+          # 1) 版本号格式（会直接当 tag 用，必须合法）
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            Write-Host "::error::版本号不能为空"
+            exit 1
+          }
+          if ($ver -notmatch '^v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            Write-Host "::error::版本号 [$ver] 不合法：要形如 v1.0.0 或 1.0.0，它会直接当 Release 标签用"
+            exit 1
+          }
+
+          # 2) 查现有 Release
+          #    gh release view 查不到时返回码 1 并往 stderr 写一行，这是正常情况，
+          #    这里自己接住 $LASTEXITCODE，绝不让它成为脚本的最终退出码。
+          $ErrorActionPreference = 'Continue'
+          $raw = gh release view $ver --json isDraft,tagName 2>$null
+          $ghCode = $LASTEXITCODE
+
+          if ($ghCode -eq 0 -and $raw) {
+            $rel = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($rel -and $rel.isDraft -eq $true) {
+              Write-Host "::warning::$ver 已有一份草稿，发布步骤会先删再建"
+            } elseif ($rel) {
+              Write-Host "::error::$ver 已经正式发布过了，换个版本号再跑"
+              exit 1
+            }
+          } else {
+            Write-Host "$ver 尚无发布记录，继续"
+          }
+
+          Write-Host "版本号校验通过：$ver"
+          exit 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+
+      - name: 检出代码
+        uses: actions/checkout@v4
 
       # 与开发机对齐：本机是 Python 3.14.x + PySide6 6.11.x。CI 换 Python 小版本
-      # 等于换一份 Qt，界面上的差异只能靠那三份冒烟兜，没必要主动冒险。
-      - uses: actions/setup-python@v5
+      # 等于换一份 Qt，界面差异只能靠那三份冒烟兜，没必要主动冒险。
+      - name: 配置 Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.14"
           architecture: x64
@@ -94,10 +141,9 @@ jobs:
           }
           exit 0
 
-      # 把产物整理成英文名 exe + zip + SHA256SUMS.txt，一起塞 release/ 目录
+      # 把产物整理成英文名 exe + zip + SHA256SUMS.txt，统一放进 release/ 目录
       - name: 整理发布文件
         shell: pwsh
-        id: prep
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -111,16 +157,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           $exeName = "xhs-live-recorder-$ver.exe"
           $zipName = "xhs-live-recorder-$ver-windows-x64.zip"
-          $exeDst = Join-Path "release" $exeName
-          $zipDst = Join-Path "release" $zipName
+          $exeDst  = Join-Path "release" $exeName
+          $zipDst  = Join-Path "release" $zipName
 
           Copy-Item $src.FullName $exeDst -Force
 
-          # 打 zip（排除已有 zip，避免把旧包自己打进去）
+          # 打 zip（先清旧 zip，避免把上一次的包自己打进去）
           if (Test-Path $zipDst) { Remove-Item $zipDst -Force }
           Compress-Archive -Path $exeDst -DestinationPath $zipDst -CompressionLevel Optimal
 
-          # SHA256 校验文件（标准两空格格式，sha256sum -c 能直接核）
+          # SHA256 校验文件（标准两空格格式，sha256sum -c 可直接核）
           $lines = @()
           Get-ChildItem release -File | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
@@ -130,16 +176,13 @@ jobs:
 
           Write-Host "准备好的发布资产："
           Get-ChildItem release -File | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length) 字节" }
-
-          # 传给下一步用
-          "exe_name=$exeName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           exit 0
         env:
           VERSION: ${{ inputs.version }}
 
-      # Artifacts 备份（Release 无过期，这里只是留一份带 run number 的存档）
-      - uses: actions/upload-artifact@v4
+      # Artifacts 备份：与 Release 资产一一对应，只是多带一个 run number 存档
+      - name: 上传 Artifacts 备份
+        uses: actions/upload-artifact@v4
         with:
           name: xhs-live-recorder-windows-x64-run${{ github.run_number }}
           path: |
@@ -149,87 +192,46 @@ jobs:
           retention-days: ${{ inputs.retention }}
           if-no-files-found: error
 
-      # 在所有构建工作都完成后，才建草稿 Release（避免传了个坏包上去）
-      - name: 校验版本号并查旧 Release
-        shell: pwsh
-        run: |
-          $ver = $env:VERSION
-
-          # 1) 校验版本号格式
-          if ([string]::IsNullOrWhiteSpace($ver)) {
-            Write-Host "::error::版本号不能为空"
-            exit 1
-          }
-          if ($ver -notmatch '^v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
-            Write-Host "::error::版本号 [$ver] 不合法：要形如 v1.0.0 或 1.0.0，它会直接当 Release 标签用"
-            exit 1
-          }
-
-          # 2) 查现有 Release
-          #    gh release view 查不到时返回码 1 + 往 stderr 写一行，这是正常情况，
-          #    我们自己接住 $LASTEXITCODE，绝不让它成为脚本最终退出码。
-          $ErrorActionPreference = 'Continue'
-          $raw = gh release view $ver --json isDraft,tagName 2>$null
-          $ghCode = $LASTEXITCODE
-
-          if ($ghCode -eq 0 -and $raw) {
-            $rel = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($rel -and $rel.isDraft -eq $true) {
-              Write-Host "::warning::$ver 已有一份草稿，发布步骤会先删再建"
-            } elseif ($rel) {
-              Write-Host "::error::$ver 已经正式发布过了，换个版本号再跑"
-              exit 1
-            }
-          } else {
-            Write-Host "$ver 尚无发布记录，继续"
-          }
-
-          Write-Host "版本号校验通过：$ver"
-          exit 0
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          VERSION: ${{ inputs.version }}
-
       - name: 发布草稿 Release
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $ver = $env:VERSION
 
-          # 1) 先尝试删掉同名草稿（第一次跑没草稿是正常的，gh 返回非 0 不算错）
-          $delOut = gh release delete $ver --yes --cleanup-tag 2>&1
-          $delCode = $LASTEXITCODE
-          if ($delCode -eq 0) {
+          # 1) 先删同名草稿（第一次跑没草稿是正常的，gh 返回非 0 不算错）
+          gh release delete $ver --yes --cleanup-tag 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) {
             Write-Host "已清理旧草稿：$ver"
+            # 保险：草稿删了但 tag 可能仍残留，再删一次；
+            # tag 不存在时 git 会报非 0，属于预期，忽略即可。
+            git push origin ":refs/tags/$ver" 2>$null | Out-Null
           } else {
             Write-Host "无需清理（本就没有同名草稿），继续"
           }
 
-          # 保险：万一远端残留了游离 tag，再删一次；tag 不存在时 git 会报非 0，忽略
-          git push origin ":refs/tags/$ver" 2>$null | Out-Null
+          # 2) 写 Release 说明（UTF-8 落盘，避免中文乱码；多行内容走文件不塞命令行）
+          #    这里用「字符串数组 + 占位符替换」而不是 PowerShell here-string：
+          #    here-string 的收尾 "@ 必须顶格，与 YAML 缩进块冲突，很容易踩坑。
+          #    数组元素一律用单引号：反引号与 $ 都是字面量，无需转义。
+          $notes = @(
+            '## 小红书直播录制器 __VER__',
+            '',
+            '### 资产说明',
+            '- `xhs-live-recorder-__VER__.exe` —— 单文件 exe，可直接运行。',
+            '- `xhs-live-recorder-__VER__-windows-x64.zip` —— 上述 exe 的 zip 打包。',
+            '- `SHA256SUMS.txt` —— 以上文件的 SHA256。下载后放同一目录，用',
+            '  `sha256sum -c SHA256SUMS.txt` 核验，或',
+            '  `certutil -hashfile xhs-live-recorder-__VER__.exe SHA256` 手动比对。',
+            '',
+            '### 使用提醒',
+            '1. 确保系统 PATH 中有 `ffmpeg`，或将 `ffmpeg.exe` 放到 exe 同目录。',
+            '2. 本构建未做代码签名，首次运行若被 Windows SmartScreen 拦截，',
+            '   点“更多信息” → “仍要运行”即可。',
+            '3. 本 Release 为草稿，核对无误后请手动点 Publish release。'
+          ) -replace '__VER__', $ver
+          $notes | Set-Content -Path release_notes.md -Encoding UTF8
 
-          # 2) 写 Release 说明（UTF-8，避免中文乱码）
-          $notes = @"
-## 小红书直播录制器 $ver
-
-### 资产说明
-- ``xhs-live-recorder-$ver.exe`` —— 单文件 exe，可直接运行。
-- ``xhs-live-recorder-$ver-windows-x64.zip`` —— 同上 exe 的 zip 打包。
-- ``SHA256SUMS.txt`` —— 以上两个文件的 SHA256，下载后放同一目录执行
-  ``certutil -hashfile xhs-live-recorder-$ver.exe SHA256``
-  比对，或用 ``sha256sum -c SHA256SUMS.txt``。
-
-### 使用提醒
-1. 确保系统 PATH 中有 ``ffmpeg``，或将 ``ffmpeg.exe`` 放到 exe 同目录。
-2. 本构建未做代码签名，首次运行若被 Windows SmartScreen 拦截，
-   点击"更多信息" → "仍要运行"即可。
-3. 本 Release 为&zwnj;**草稿**&zwnj;，核对无误后请手动点 "Publish release"。
-"@
-          Set-Content -Path release_notes.md -Value $notes -Encoding UTF8
-
-          # 3) 建草稿 Release
-          #    --target 指向本次 commit，避免同名旧 tag 指到错误提交
+          # 3) 建草稿 Release（--target 指向本次 commit，避免同名旧 tag 指错提交）
           gh release create $ver `
             --draft `
             --target $env:GITHUB_SHA `
@@ -239,9 +241,8 @@ jobs:
             release/xhs-live-recorder-$ver-windows-x64.zip `
             release/SHA256SUMS.txt
 
-          $createCode = $LASTEXITCODE
-          if ($createCode -ne 0) {
-            Write-Host "::error::创建草稿 Release 失败（gh 退出码 $createCode）"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::创建草稿 Release 失败（gh 退出码 $LASTEXITCODE）"
             exit 1
           }
 
