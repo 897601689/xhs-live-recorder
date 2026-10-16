@@ -1,10 +1,18 @@
-# 手动打一个 Windows 单文件 exe：Actions → 「打包 Windows 版」→ Run workflow。
+# 手动打一个 Windows 单文件 exe，顺带发一个草稿 Release：
+# Actions → 「打包 Windows 版」→ Run workflow → 填版本号（形如 v1.0.0）。
+#
+# 产物有两个去处：
+#   1. 这次运行的 Artifacts —— 留一份备份，内容和 Release 上挂的资产一模一样；
+#   2. 一个草稿（Draft）Release —— 要到 Releases 页面点一下 Publish 才会公开。
+#      每次跑都会先清掉同名旧草稿再重建，所以同一个版本号可以反复重跑；
+#      但已经正式发布过的版本号不会被覆盖，会直接报错让你换号（发出去的包不该被悄悄换掉）。
 #
 # 为什么不挂在 push 上：PyInstaller 不能交叉编译，一台 runner 只能出它自己系统的包；
 # 一轮下载 Qt 轮子 + 跑三份冒烟 + 打包约十分钟，而仓库里多数提交是文档和界面微调，
 # 每次 push 都出一个没人测过的包反而更容易拿错版本。
 #
-# 产物挂在本次运行的 Artifacts 里（不是 Release），下载后和 dist\小红书直播录制器.exe 等价：
+# Release 资产一律用英文名（xhs-live-recorder-<版本>.exe / .zip / SHA256SUMS.txt）：
+# 中文只留在日志正文和 Release 标题里，少一处编码差异少一处坑。
 # ffmpeg 不打包，靠系统 PATH 或放在 exe 同目录。未做代码签名，别人第一次运行可能被
 # SmartScreen 拦一次。
 name: 打包 Windows 版
@@ -12,8 +20,12 @@ name: 打包 Windows 版
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: 版本号，会直接当 Release 标签用（形如 v1.0.0）
+        required: true
+        type: string
       retention:
-        description: 产物保留天数
+        description: Artifacts 备份保留天数（Release 没有保留期一说，不受此项影响）
         type: choice
         default: "30"
         options:
@@ -22,8 +34,9 @@ on:
           - "30"
           - "90"
 
+# 建 Release 要写权限；读的部分也不用再单独列，contents: write 已含读
 permissions:
-  contents: read
+  contents: write
 
 # 同一时间只让一条构建在跑；正在跑的不清掉，避免手滑把别人等的包取消
 concurrency:
@@ -43,6 +56,35 @@ jobs:
       PYTHONIOENCODING: utf-8
 
     steps:
+      # 版本号是手填的，写错了后面十分钟全白干，所以卡在下载依赖之前。
+      # 这一步还没 checkout，gh 认不出仓库，得靠 GH_REPO 直接告诉它 owner/repo。
+      - name: 校验版本号
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:VERSION -notmatch '^v?\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+            Write-Host "::error::版本号 [$env:VERSION] 不合法：要形如 v1.0.0 或 1.0.0，它会直接当 Release 标签用"
+            exit 1
+          }
+
+          # 查不到 Release 时 gh 会往 stderr 写一行并以非 0 退出，而 runner 的
+          # PowerShell 默认 $ErrorActionPreference='stop'，容易把它当成致命错误；
+          # 这里显式放宽，成败只认退出码。
+          $ErrorActionPreference = 'Continue'
+
+          # 这一步只挡「已经正式发布过」的版本号；同名草稿留到建 Release 那一步再清
+          $raw = gh release view $env:VERSION --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0 -and $raw) {
+            if (($raw | ConvertFrom-Json).isDraft) {
+              Write-Host "$env:VERSION 已经有一份草稿了，本次会先把它删掉再重建"
+            } else {
+              Write-Host "::error::$env:VERSION 已经正式发布过了，换个版本号再跑"
+              exit 1
+            }
+          }
+
       - uses: actions/checkout@v7
 
       # 与开发机对齐：本机是 Python 3.14.2 + PySide6 6.11.2。CI 换 Python 小版本
@@ -89,10 +131,80 @@ jobs:
             exit 1
           }
 
-      # artifact 名必须是 ASCII：Actions 的产物名不接中文，但包里的 exe 保留中文名
+      # Release 资产统一改英文名：xhs-live-recorder-<版本>.exe，另配一份 zip
+      # 给只想点一下的人；SHA256SUMS.txt 里两条哈希都记上，下载后能直接核。
+      - name: 整理发布文件
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $exe = Get-ChildItem dist -Filter *.exe | Select-Object -First 1
+          $exeAsset = "xhs-live-recorder-$env:VERSION.exe"
+          $zipAsset = "xhs-live-recorder-$env:VERSION-windows-x64.zip"
+
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item $exe.FullName "release/$exeAsset" -Force
+          Compress-Archive -Path "release/$exeAsset" -DestinationPath "release/$zipAsset" -Force
+
+          # 两空格分隔、只写文件名不写目录，下下来放一起就能 sha256sum -c
+          @(
+            "$((Get-FileHash "release/$exeAsset" -Algorithm SHA256).Hash.ToLower())  $exeAsset"
+            "$((Get-FileHash "release/$zipAsset" -Algorithm SHA256).Hash.ToLower())  $zipAsset"
+          ) | Out-File -Encoding ascii release/SHA256SUMS.txt
+
+          # 说明文字写成文件再交给 gh，不把多行中文当命令行参数递过去
+          $notes = @"
+          Windows x64 单文件版，与 dist\小红书直播录制器.exe 等价。
+
+          - ffmpeg 不打包：放进系统 PATH，或与 exe 放同一目录即可。
+          - 未做代码签名：别人第一次运行可能被 SmartScreen 拦一次。
+          - 静态检查 / 核心层冒烟 / 界面冒烟三份全绿之后才打的包。
+          - 构建：Actions 运行 #$env:GITHUB_RUN_NUMBER，提交 $env:GITHUB_SHA
+          "@
+          $notes | Out-File -Encoding utf8 release/RELEASE_NOTES.md
+
+          Get-ChildItem release | ForEach-Object { Write-Host "待发布: $($_.Name)  $($_.Length) 字节" }
+
+      # artifact 名必须是 ASCII：Actions 的产物名不接中文。
+      # 只传 Release 上挂的那三样，备份和线上资产保持一一对应。
       - uses: actions/upload-artifact@v7
         with:
           name: xhs-live-recorder-windows-x64-run${{ github.run_number }}
-          path: dist/*.exe
+          path: |
+            release/*.exe
+            release/*.zip
+            release/SHA256SUMS.txt
           retention-days: ${{ inputs.retention }}
           if-no-files-found: error
+
+      # 建草稿而不是直接发布：包没签名、也没在别人机器上验过，按 Publish 的那一下留在人手上
+      - name: 建草稿 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # 「没东西可删」时 gh/git 都会往 stderr 写一行并非 0 退出，属预期，不该判整步失败；
+          # 真正的成败由最后那条 gh release create 的退出码说了算。
+          $ErrorActionPreference = 'Continue'
+
+          # 同名草稿先清掉：每次跑出来的都是同一份产物，留着旧的 gh release create 会直接报「已存在」
+          gh release delete $env:VERSION --yes 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            # 刚删的是同名旧草稿，它的标签可能已经落到远端了，一并清掉，让新标签指回本次构建的提交。
+            # 本来就没有草稿就不碰远端，免得误删谁手动打的 tag。
+            git push origin ":refs/tags/$env:VERSION" 2>$null
+          }
+
+          gh release create $env:VERSION `
+            --draft `
+            --target $env:GITHUB_SHA `
+            --title "小红书直播录制器 $env:VERSION" `
+            --notes-file release/RELEASE_NOTES.md `
+            "release/xhs-live-recorder-$env:VERSION.exe" `
+            "release/xhs-live-recorder-$env:VERSION-windows-x64.zip" `
+            "release/SHA256SUMS.txt"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::gh release create 没成功（退出码 $LASTEXITCODE），草稿没建出来"
+            exit 1
+          }
+          Write-Host "草稿已建好：标签 $env:VERSION，到 Releases 页面确认无误再点 Publish"
